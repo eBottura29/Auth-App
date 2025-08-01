@@ -68,7 +68,8 @@ def sign_up(username, password):
     if username in database["users"]:
         return 2  # Already exists
 
-    database["users"][username] = password
+    # Hash the password before storing
+    database["users"][username] = bcrypt.hashpw(password.encode(), bcrypt.gensalt())
     database["last_session_id"] += 1
 
     save_encrypted_object(database, DATABASE_FILE)
