@@ -71,7 +71,7 @@ def sign_up(username, password):
     database["users"][username] = password
     database["last_session_id"] += 1
 
-    save_encrypted_object(DATABASE_FILE, database)
+    save_encrypted_object(database, DATABASE_FILE)
 
     return 0  # Success
 
