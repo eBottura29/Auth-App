@@ -1,20 +1,27 @@
-# bruteforcer.py
+# yes ai was used, dont kill me!!
+# im not gonna do this manually
 import tkinter as tk
 from tkinter import messagebox
 from storage import load_encrypted_object
-from string import printable
+from string import printable, digits, ascii_letters
 import concurrent.futures
 import multiprocessing
 import time
 import os
 import bcrypt
+from typing import Tuple
 
 BASE_DIR = os.path.dirname(__file__)
 DB_FOLDER = os.path.abspath(os.path.join(BASE_DIR, "./db"))
 DATABASE_FILE = os.path.join(DB_FOLDER, "database.db")
 
 
-def check_password_chunk(
+# ------------------------------------------------------------
+# Worker function (top-level for pickling). It works on a
+# range of indices for a specific phase/charset. It reports
+# progress through progress_queue and reports 'found' if success.
+# ------------------------------------------------------------
+def check_password_chunk_phase(
     start_idx: int,
     end_idx: int,
     charset: str,
@@ -22,15 +29,24 @@ def check_password_chunk(
     target_hash: bytes,
     stop_event,
     progress_queue,
-    report_every: int = 256,
+    report_every: int,
+    phase_id: int,
+    prev_phase_chars: str,
 ) -> int:
     """
-    Try indices in [start_idx, end_idx).
-    - Periodically send progress messages to progress_queue as ('progress', n_checked).
-    - If password found, send ('found', idx) and return idx.
-    - On normal completion, send a final ('progress', n_remaining) and return -1.
+    Try indices in [start_idx, end_idx) for the given charset.
+    - `phase_id` (0,1,2) identifies which phase we're testing.
+    - `prev_phase_chars` is a string of characters that define the previous-phase alphabet:
+       * For phase 1 prev_phase_chars = '' (unused).
+       * For phase 2 prev_phase_chars = digits (we skip "all-digit" passwords).
+       * For phase 3 prev_phase_chars = digits+letters (we skip any password that is entirely digits+letters).
+    Behavior:
+    - Sends ("progress", phase_id, n_checked) periodically.
+    - If found, sends ("progress", phase_id, n_checked) for final chunk, then ("found", phase_id, password) and returns idx.
+    - On graceful stop or normal completion returns -1.
     """
     base = len(charset)
+    prev_set = set(prev_phase_chars) if prev_phase_chars else None
 
     def index_to_password(index: int) -> str:
         chars = []
@@ -40,122 +56,208 @@ def check_password_chunk(
         return "".join(reversed(chars))
 
     checked_since_report = 0
-    total_checked = 0
-
     for idx in range(start_idx, end_idx):
         if stop_event.is_set():
-            # send any remaining progress before exiting
             if checked_since_report:
-                progress_queue.put(("progress", checked_since_report))
+                progress_queue.put(("progress", phase_id, checked_since_report))
             return -1
 
         pw = index_to_password(idx)
-        total_checked += 1
+
+        # Skip passwords that belong entirely to previous phase(s).
+        # Phase 2: skip if all chars in digits
+        # Phase 3: skip if all chars in digits+letters (prev_set contains digits+letters)
+        if prev_set is not None:
+            all_prev = True
+            for ch in pw:
+                if ch not in prev_set:
+                    all_prev = False
+                    break
+            if all_prev:
+                # do not count as a check here (we already checked them in previous phase)
+                continue
+
+        # Now this is a new, unique candidate to check
         checked_since_report += 1
 
         if bcrypt.checkpw(pw.encode(), target_hash):
-            # report the checks done up to and including the found password
+            # report progress up to and including this success
             if checked_since_report:
-                progress_queue.put(("progress", checked_since_report))
-            progress_queue.put(("found", idx))
+                progress_queue.put(("progress", phase_id, checked_since_report))
+            progress_queue.put(("found", phase_id, pw))
             return idx
 
-        # report periodically to avoid too many small messages
         if checked_since_report >= report_every:
-            progress_queue.put(("progress", checked_since_report))
+            progress_queue.put(("progress", phase_id, checked_since_report))
             checked_since_report = 0
 
-    # send any final leftover progress
+    # finished chunk - report any leftover
     if checked_since_report:
-        progress_queue.put(("progress", checked_since_report))
-
+        progress_queue.put(("progress", phase_id, checked_since_report))
     return -1
 
 
+# ------------------------------------------------------------
+# Main UI and orchestration
+# ------------------------------------------------------------
 class BruteForceUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("Password Brute-Forcer")
-        self.root.geometry("560x380")
+        self.root.title("Password Brute-Forcer (phased order)")
+        self.root.geometry("720x460")
 
-        self.stop_event = None  # multiprocessing Event for cancel
+        # Define charsets for phases
+        self.phase_charsets = [
+            digits,  # phase 0: digits only
+            digits + ascii_letters,  # phase 1: digits + letters
+            printable[
+                :-6
+            ],  # phase 2: full printable minus last 6 whitespace (as before)
+        ]
+        # prev_phase_chars used to skip duplicates:
+        # phase0 prev = ''
+        # phase1 prev = digits
+        # phase2 prev = digits+letters
+        self.prev_phase_chars = ["", digits, digits + ascii_letters]
+
+        self.pw_len = 8
+        # Precompute per-phase totals (unique counts per phase)
+        self.phase_totals = self._compute_phase_totals()
+        self.total_passwords = sum(self.phase_totals)
+
+        # multiprocess primitives
+        self.manager = None
+        self.stop_event = None
         self.progress_queue = None
         self.executor = None
         self.active_futures = set()
+
+        # runtime counters
+        self.current_phase = 0
+        self.next_index = 0
+        self.checked_per_phase = [
+            0,
+            0,
+            0,
+        ]  # counts of actual attempted/checks per phase
+        self.checked_total = 0
+        self.start_time = None
         self.target_hash = None
 
         self.found_password = None
-        self.found_index = None
+        self.found_phase = None
 
-        self.charset = printable[:-6]
-        self.password_length = 8
-        self.max_index = len(self.charset) ** self.password_length
-
-        # runtime counters
-        self.next_index = 0
-        self.checked = 0
-        self.start_time = None
-
+        # UI elements
         self.main_frame = tk.Frame(root)
         self.main_frame.pack(padx=12, pady=12, fill="both", expand=True)
-        self.build_ui()
+        self._build_ui()
 
-    def build_ui(self):
+    def _compute_phase_totals(self):
+        # phase0_total = 10**8
+        # phase1_total = (62**8) - (10**8)
+        # phase2_total = (94**8) - (62**8)
+        a = pow(len(self.phase_charsets[0]), self.pw_len)  # digits^8
+        b = pow(len(self.phase_charsets[1]), self.pw_len)  # digits+letters ^8
+        c = pow(len(self.phase_charsets[2]), self.pw_len)  # full charset ^8
+        return [a, b - a, c - b]
+
+    def _build_ui(self):
         for w in self.main_frame.winfo_children():
             w.destroy()
 
+        top = tk.Frame(self.main_frame)
+        top.pack(fill="x", pady=(0, 8))
+
         tk.Label(
-            self.main_frame, text="Brute-Force Attack Tool", font=("Helvetica", 14)
-        ).pack(pady=6)
-        tk.Label(self.main_frame, text="Target Username (local DB):").pack(anchor="w")
-        self.username_entry = tk.Entry(self.main_frame)
-        self.username_entry.pack(pady=4, fill="x")
+            top,
+            text="Brute-Force (phased: digits → digits+letters → all)",
+            font=("Helvetica", 14),
+        ).pack(anchor="w")
+
+        entry_row = tk.Frame(self.main_frame)
+        entry_row.pack(fill="x", pady=(4, 8))
+        tk.Label(entry_row, text="Target Username (local DB):").pack(side="left")
+        self.username_entry = tk.Entry(entry_row)
+        self.username_entry.pack(side="left", padx=8)
 
         controls = tk.Frame(self.main_frame)
-        controls.pack(pady=6, fill="x")
+        controls.pack(fill="x", pady=(4, 8))
         tk.Button(controls, text="Start Attack", command=self.start_attack).pack(
             side="left", padx=4
         )
         self.cancel_btn = tk.Button(
-            controls, text="Cancel Attack", state="disabled", command=self.cancel_attack
+            controls, text="Cancel", state="disabled", command=self.cancel_attack
         )
         self.cancel_btn.pack(side="left", padx=4)
 
         cfg = tk.Frame(self.main_frame)
-        cfg.pack(pady=6, fill="x")
+        cfg.pack(fill="x", pady=(4, 8))
         tk.Label(cfg, text="Workers:").pack(side="left")
         self.workers_var = tk.IntVar(value=max(1, os.cpu_count() or 1))
         tk.Entry(cfg, width=4, textvariable=self.workers_var).pack(side="left", padx=4)
 
         tk.Label(cfg, text="Chunk size:").pack(side="left", padx=(8, 0))
-        self.chunk_var = tk.IntVar(value=2000)
+        self.chunk_var = tk.IntVar(value=5000)
         tk.Entry(cfg, width=7, textvariable=self.chunk_var).pack(side="left", padx=4)
 
         tk.Label(cfg, text="Report every (worker):").pack(side="left", padx=(8, 0))
         self.report_var = tk.IntVar(value=256)
         tk.Entry(cfg, width=6, textvariable=self.report_var).pack(side="left", padx=4)
 
-        # progress area
-        self.output_label = tk.Label(
+        # Total progress UI
+        self.total_frame = tk.Frame(self.main_frame, relief="groove", bd=1)
+        self.total_frame.pack(fill="x", pady=(8, 6))
+        tk.Label(
+            self.total_frame, text="Total Progress", font=("Helvetica", 10, "bold")
+        ).pack(anchor="w", padx=6, pady=(6, 0))
+        self.total_label = tk.Label(
+            self.total_frame, text=f"0 / {self.total_passwords} (0.00%)"
+        )
+        self.total_label.pack(anchor="w", padx=6)
+        self.total_canvas = tk.Canvas(self.total_frame, height=20)
+        self.total_canvas.pack(fill="x", padx=6, pady=(4, 6))
+        self.total_rect_tag = "total_progress_rect"
+
+        # Per-phase progress UI
+        self.phase_frames = []
+        self.phase_labels = []
+        self.phase_canvases = []
+        for i in range(3):
+            pf = tk.Frame(self.main_frame, relief="ridge", bd=1)
+            pf.pack(fill="x", pady=(4, 2))
+            tk.Label(
+                pf,
+                text=f"Phase {i+1}: {self._phase_description(i)}",
+                font=("Helvetica", 10, "bold"),
+            ).pack(anchor="w", padx=6, pady=(6, 0))
+            lbl = tk.Label(pf, text=f"0 / {self.phase_totals[i]} (0.00%)")
+            lbl.pack(anchor="w", padx=6)
+            cn = tk.Canvas(pf, height=14)
+            cn.pack(fill="x", padx=6, pady=(4, 6))
+            self.phase_frames.append(pf)
+            self.phase_labels.append(lbl)
+            self.phase_canvases.append(cn)
+
+        # Status / speed
+        self.status_label = tk.Label(
             self.main_frame, text="Status: Idle", anchor="w", justify="left"
         )
-        self.output_label.pack(pady=8, fill="x")
+        self.status_label.pack(fill="x", pady=(8, 0))
 
-        self.progress_bar_frame = tk.Frame(self.main_frame)
-        self.progress_bar_frame.pack(fill="x", pady=6)
-        self.progress_var = tk.DoubleVar(value=0.0)
-        self.progress_label = tk.Label(self.progress_bar_frame, text="0 / 0 (0.00%)")
-        self.progress_label.pack(side="left")
+    def _phase_description(self, i: int) -> str:
+        if i == 0:
+            return "Digits only (0-9)"
+        if i == 1:
+            return "Digits + letters (0-9, a-z, A-Z), excluding all-digits"
+        return "Full printable charset (excludes previous charset-only combos)"
 
-        # simple progress bar using Canvas
-        self.canvas = tk.Canvas(self.progress_bar_frame, height=18)
-        self.canvas.pack(side="right", fill="x", expand=True, padx=(8, 0))
-        self.canvas_rect = None
-
+    # --------------------------
+    # Starting / orchestrating
+    # --------------------------
     def start_attack(self):
         username = self.username_entry.get().strip()
         if not username:
-            messagebox.showwarning("Missing", "Enter a username.")
+            messagebox.showwarning("Missing", "Please enter a username.")
             return
 
         db = load_encrypted_object(DATABASE_FILE)
@@ -165,65 +267,81 @@ class BruteForceUI:
                 "User not found", f"User '{username}' does not exist in local DB."
             )
             return
-
         if isinstance(stored_hash, str):
             stored_hash = stored_hash.encode()
 
-        # reset runtime state
+        # Reset runtime state
         self.cancel_btn.config(state="normal")
-        self.output_label.config(text="Brute-force started...")
-        self.found_password = None
-        self.found_index = None
+        self.status_label.config(text="Brute-force started...")
+        self.current_phase = 0
         self.next_index = 0
-        self.checked = 0
+        self.checked_per_phase = [0, 0, 0]
+        self.checked_total = 0
         self.start_time = time.time()
         self.target_hash = stored_hash
+        self.found_password = None
+        self.found_phase = None
 
-        # multiprocess primitives
-        mgr = multiprocessing.Manager()
-        self.stop_event = mgr.Event()
-        self.progress_queue = mgr.Queue()
+        # Multiprocess primitives
+        self.manager = multiprocessing.Manager()
+        self.stop_event = self.manager.Event()
+        self.progress_queue = self.manager.Queue()
 
-        # executor
+        # ProcessPool
         workers = max(1, int(self.workers_var.get()))
         self.executor = concurrent.futures.ProcessPoolExecutor(max_workers=workers)
 
-        # submit initial jobs (up to workers)
-        chunk_size = max(1, int(self.chunk_var.get()))
-        report_every = max(1, int(self.report_var.get()))
-        self.chunk_size = chunk_size
-        self.report_every = report_every
+        # Submit initial work for phase 0
+        self._start_phase(self.current_phase)
 
-        self.active_futures = set()
-        for _ in range(workers):
-            self._submit_next_chunk()
-
-        # start polling both futures and progress queue
+        # Start polling loop
         self.root.after(100, self._poll_loop)
 
-    def _submit_next_chunk(self):
-        if self.next_index >= self.max_index or (
+    def _start_phase(self, phase: int):
+        # prepare phase-specific parameters
+        charset = self.phase_charsets[phase]
+        total_indices = pow(len(charset), self.pw_len)
+        self.phase_index_limit = (
+            total_indices  # indices for this phase's charset (0..limit-1)
+        )
+        self.next_index = 0
+
+        # active futures set
+        self.active_futures = set()
+        chunk_size = max(1, int(self.chunk_var.get()))
+        workers = max(1, int(self.workers_var.get()))
+        # Submit up to `workers` initial chunks
+        for _ in range(workers):
+            self._submit_chunk_for_phase(phase, chunk_size)
+
+    def _submit_chunk_for_phase(self, phase: int, chunk_size: int):
+        if self.next_index >= self.phase_index_limit or (
             self.stop_event and self.stop_event.is_set()
         ):
             return
         start = self.next_index
-        end = min(self.max_index, start + self.chunk_size)
+        end = min(self.phase_index_limit, start + chunk_size)
         fut = self.executor.submit(
-            check_password_chunk,
+            check_password_chunk_phase,
             start,
             end,
-            self.charset,
-            self.password_length,
+            self.phase_charsets[phase],
+            self.pw_len,
             self.target_hash,
             self.stop_event,
             self.progress_queue,
-            self.report_every,
+            max(1, int(self.report_var.get())),
+            phase,
+            self.prev_phase_chars[phase],
         )
         self.active_futures.add((fut, start, end))
         self.next_index = end
 
+    # --------------------------
+    # Polling and progress update
+    # --------------------------
     def _drain_progress_queue(self):
-        """Read all queued progress/found messages and update internal counters."""
+        """Process all messages in progress_queue and update counts."""
         while True:
             try:
                 msg = self.progress_queue.get_nowait()
@@ -231,74 +349,81 @@ class BruteForceUI:
                 break
             if not isinstance(msg, tuple) or len(msg) < 2:
                 continue
-            tag, val = msg[0], msg[1]
+            tag = msg[0]
             if tag == "progress":
-                # val is number of checked passwords since last report
-                self.checked += int(val)
+                _, phase_id, n = msg
+                n = int(n)
+                self.checked_per_phase[int(phase_id)] += n
+                self.checked_total += n
             elif tag == "found":
-                # val is index where password was found
-                self.found_index = int(val)
-                self.found_password = self._index_to_password(self.found_index)
-                # stop everything
+                _, phase_id, pw = msg
+                self.found_phase = int(phase_id)
+                self.found_password = str(pw)
+                # tell workers to stop
                 if self.stop_event:
                     self.stop_event.set()
-            # ignore unknown tags
 
     def _poll_loop(self):
-        # first, drain progress messages (updates checked)
+        # Drain queue first
         if self.progress_queue:
             self._drain_progress_queue()
 
-        # check futures that completed and submit more work as needed
-        finished = []
+        # Check active futures for completion, gather results, and refill
+        finished_items = []
         for fut, s, e in list(self.active_futures):
             if fut.done():
-                finished.append((fut, s, e))
+                finished_items.append((fut, s, e))
                 try:
                     res = fut.result(timeout=0)
                 except Exception:
                     res = -1
-
-                # If a worker found the password, found message already handled via queue;
-                # but double-check result and set found_index if needed.
+                # If worker found something, it should have put ("found", ...) into queue already.
                 if res is not None and res != -1:
-                    self.found_index = res
-                    self.found_password = self._index_to_password(res)
-                    if self.stop_event:
-                        self.stop_event.set()
-
-        # remove finished and submit new chunks (one per finished)
-        for item in finished:
+                    # fallback: if no queue message arrived, set found here
+                    if not self.found_password:
+                        # compute the actual password from index using the phase charset
+                        pw = self._index_to_password_phase(res, self.current_phase)
+                        self.found_phase = self.current_phase
+                        self.found_password = pw
+                        if self.stop_event:
+                            self.stop_event.set()
+        # remove finished items and submit a replacement chunk (if phase still has indices)
+        for item in finished_items:
             if item in self.active_futures:
                 self.active_futures.remove(item)
-            # submit next chunk for this freed worker
+            # submit new chunk for the freed worker
             if not (self.stop_event and self.stop_event.is_set()):
-                self._submit_next_chunk()
+                self._submit_chunk_for_phase(
+                    self.current_phase, max(1, int(self.chunk_var.get()))
+                )
 
-        # update UI status and progress bar
+        # update UI elements (total and per-phase)
         elapsed = time.time() - self.start_time if self.start_time else 0.0
-        rate = self.checked / elapsed if elapsed > 0 else 0.0
-        percent = (self.checked / self.max_index) * 100 if self.max_index else 0.0
-        self.output_label.config(
-            text=f"Checked: {self.checked} / {self.max_index} — {rate:.1f} checks/s"
+        rate = self.checked_total / elapsed if elapsed > 0 else 0.0
+        total_percent = (
+            (self.checked_total / self.total_passwords) * 100
+            if self.total_passwords
+            else 0.0
         )
-        self.progress_label.config(
-            text=f"{self.checked} / {self.max_index} ({percent:.4f}%)"
+        self.status_label.config(
+            text=f"Phase {self.current_phase+1} running. Speed: {rate:.1f} checks/s"
         )
+        self.total_label.config(
+            text=f"{self.checked_total} / {self.total_passwords} ({total_percent:.6f}%)"
+        )
+        self._draw_canvas(self.total_canvas, self.total_rect_tag, total_percent)
 
-        # update canvas progress bar
-        self.canvas.delete("progress_rect")
-        w = self.canvas.winfo_width() or 200
-        fill_w = int((percent / 100.0) * w)
-        if fill_w > 0:
-            self.canvas.create_rectangle(
-                0, 0, fill_w, 18, fill="green", tags="progress_rect"
-            )
-        self.canvas.create_rectangle(0, 0, w, 18, outline="black", tags="progress_rect")
+        # per-phase bars
+        for i in range(3):
+            checked = self.checked_per_phase[i]
+            total = self.phase_totals[i]
+            pct = (checked / total) * 100 if total else 0.0
+            self.phase_labels[i].config(text=f"{checked} / {total} ({pct:.6f}%)")
+            self._draw_canvas(self.phase_canvases[i], f"phase{i}_rect", pct)
 
-        # check termination conditions
+        # termination checks:
         if self.found_password:
-            # found: shutdown executor and show results
+            # shutdown executor and present found UI
             try:
                 if self.executor:
                     self.executor.shutdown(wait=False)
@@ -307,35 +432,55 @@ class BruteForceUI:
             self._display_found()
             return
 
-        # if no more active futures and we've sent all chunks
-        if not self.active_futures and self.next_index >= self.max_index:
-            # drain any last progress messages
-            if self.progress_queue:
-                self._drain_progress_queue()
-            self.output_label.config(text="Attack finished. No match found.")
-            try:
-                if self.executor:
-                    self.executor.shutdown(wait=False)
-            except Exception:
-                pass
-            self._finalize()
-            return
+        # If no more active futures AND we've exhausted indices for this phase -> move to next phase
+        if not self.active_futures and self.next_index >= self.phase_index_limit:
+            # Phase finished. Move to next if any
+            self.current_phase += 1
+            if self.current_phase >= len(self.phase_charsets):
+                # All phases done
+                # drain any last messages
+                if self.progress_queue:
+                    self._drain_progress_queue()
+                self.status_label.config(text="Attack finished. No match found.")
+                try:
+                    if self.executor:
+                        self.executor.shutdown(wait=False)
+                except Exception:
+                    pass
+                self._finalize()
+                return
+            else:
+                # Start next phase
+                self._start_phase(self.current_phase)
 
-        # otherwise keep polling
+        # otherwise, schedule next poll
         self.root.after(100, self._poll_loop)
 
-    def _index_to_password(self, index: int) -> str:
-        base = len(self.charset)
+    def _draw_canvas(self, canvas: tk.Canvas, tag: str, percent: float):
+        canvas.delete(tag)
+        w = canvas.winfo_width() or 200
+        fill_w = int((percent / 100.0) * w)
+        if fill_w > 0:
+            canvas.create_rectangle(
+                0, 0, fill_w, canvas.winfo_height(), fill="green", tags=tag
+            )
+        canvas.create_rectangle(
+            0, 0, w, canvas.winfo_height(), outline="black", tags=tag
+        )
+
+    def _index_to_password_phase(self, index: int, phase: int) -> str:
+        charset = self.phase_charsets[phase]
+        base = len(charset)
         chars = []
-        for _ in range(self.password_length):
+        for _ in range(self.pw_len):
             index, rem = divmod(index, base)
-            chars.append(self.charset[rem])
+            chars.append(charset[rem])
         return "".join(reversed(chars))
 
     def cancel_attack(self):
         if self.stop_event:
             self.stop_event.set()
-        self.output_label.config(text="Attack canceled by user.")
+        self.status_label.config(text="Attack canceled by user.")
         try:
             if self.executor:
                 self.executor.shutdown(wait=False)
@@ -350,9 +495,7 @@ class BruteForceUI:
         tk.Label(
             self.main_frame, text="Password Found!", font=("Helvetica", 14), fg="green"
         ).pack(pady=8)
-        tk.Label(
-            self.main_frame, text=f"Index: {self.found_index}", font=("Helvetica", 10)
-        ).pack()
+        tk.Label(self.main_frame, text=f"Phase: {self.found_phase+1}").pack()
         tk.Label(
             self.main_frame,
             text=f"Password: {self.found_password}",
@@ -370,7 +513,6 @@ class BruteForceUI:
         messagebox.showinfo("Copied", "Password copied to clipboard!")
 
     def _finalize(self):
-        # disable controls and leave the status label updated
         try:
             self.cancel_btn.config(state="disabled")
         except Exception:
